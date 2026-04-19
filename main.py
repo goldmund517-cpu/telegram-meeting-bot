@@ -183,7 +183,7 @@ def handle_text(chat_id, user_id, text):
 # Gemini 逐字稿
 # ─────────────────────────────────────────
 def transcribe_with_gemini(audio_path):
-    model = genai.GenerativeModel("gemini-1.5-pro")
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
     ext = audio_path.split(".")[-1].lower()
     mime_map = {
