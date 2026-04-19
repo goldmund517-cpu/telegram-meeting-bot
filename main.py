@@ -5,7 +5,6 @@ import requests
 import subprocess
 import re
 from flask import Flask, request
-import google.generativeai as genai
 from openai import OpenAI
 import httpx
 
@@ -13,11 +12,9 @@ app = Flask(__name__)
 
 # 環境變數
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # 初始化
-genai.configure(api_key=GEMINI_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client())
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -41,12 +38,11 @@ def webhook():
     chat_id = message["chat"]["id"]
     user_id = str(message["from"]["id"])
 
-    # 語音/音訊檔案
     audio = message.get("voice") or message.get("audio") or message.get("document")
     text = message.get("text", "").strip()
 
     if audio:
-        handle_audio(chat_id, user_id, audio, message)
+        handle_audio(chat_id, user_id, audio)
     elif text:
         handle_text(chat_id, user_id, text)
 
@@ -54,7 +50,7 @@ def webhook():
 
 @app.route("/", methods=["GET"])
 def health():
-    return "Telegram Bot is running!"
+    return "Telegram Meeting Bot is running!"
 
 # ─────────────────────────────────────────
 # 傳送訊息
@@ -68,7 +64,7 @@ def send_message(chat_id, text):
 
 def send_document(chat_id, file_path, filename):
     with open(file_path, "rb") as f:
-        requests.post(f"{TELEGRAM_API}/sendDocument", 
+        requests.post(f"{TELEGRAM_API}/sendDocument",
             data={"chat_id": chat_id},
             files={"document": (filename, f, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
         )
@@ -76,25 +72,27 @@ def send_document(chat_id, file_path, filename):
 # ─────────────────────────────────────────
 # 處理音訊
 # ─────────────────────────────────────────
-def handle_audio(chat_id, user_id, audio, message):
-    send_message(chat_id, "⏳ 收到音訊，處理中請稍候...\n（較長的錄音可能需要1~2分鐘）")
+def handle_audio(chat_id, user_id, audio):
+    send_message(chat_id, "⏳ 收到音訊，處理中請稍候...\n（較長的錄音可能需要2~3分鐘）")
 
     try:
         # 取得檔案
         file_id = audio.get("file_id")
         file_info = requests.get(f"{TELEGRAM_API}/getFile?file_id={file_id}").json()
-        file_path = file_info["result"]["file_path"]
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        file_path_tg = file_info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path_tg}"
 
         # 下載檔案
-        ext = file_path.split(".")[-1] if "." in file_path else "ogg"
+        ext = file_path_tg.split(".")[-1] if "." in file_path_tg else "ogg"
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
-            content = requests.get(file_url).content
-            f.write(content)
+            f.write(requests.get(file_url).content)
             audio_path = f.name
 
-        # Gemini 逐字稿
-        transcript, speaker_samples, meeting_info = transcribe_with_gemini(audio_path)
+        # Whisper 轉文字
+        transcript_text = transcribe_with_whisper(audio_path)
+
+        # GPT 做語者辨識
+        transcript, speaker_samples, meeting_info = analyze_speakers(transcript_text)
         os.unlink(audio_path)
 
         # 儲存 session
@@ -106,7 +104,7 @@ def handle_audio(chat_id, user_id, audio, message):
         }
 
         if not meeting_info["confirmed"]:
-            send_message(chat_id, 
+            send_message(chat_id,
                 "📋 語音中未偵測到會議資訊，請提供：\n\n"
                 "請回覆格式：\n"
                 "<code>日期=2024/01/15，名稱=Q3預算會議</code>"
@@ -125,7 +123,7 @@ def handle_text(chat_id, user_id, text):
     session = user_sessions.get(user_id)
 
     if not session:
-        send_message(chat_id, 
+        send_message(chat_id,
             "👋 歡迎使用會議記錄助理！\n\n"
             "請直接傳送會議錄音檔，支援格式：\n"
             "• 語音訊息\n• mp3、m4a、wav、ogg、mp4 等"
@@ -134,11 +132,10 @@ def handle_text(chat_id, user_id, text):
 
     state = session.get("state")
 
-    # 等待會議資訊
     if state == "waiting_meeting_info":
         meeting_info = parse_meeting_info(text)
         if not meeting_info:
-            send_message(chat_id, 
+            send_message(chat_id,
                 "格式不正確，請使用：\n"
                 "<code>日期=2024/01/15，名稱=Q3預算會議</code>"
             )
@@ -150,7 +147,6 @@ def handle_text(chat_id, user_id, text):
         msg = build_speaker_confirm_message(session["speaker_samples"], session["meeting_info"])
         send_message(chat_id, msg)
 
-    # 等待語者確認
     elif state == "waiting_speaker_confirm":
         speaker_map = parse_speaker_map(text)
         if not speaker_map:
@@ -180,65 +176,68 @@ def handle_text(chat_id, user_id, text):
             send_message(chat_id, f"❌ 生成 Word 時發生錯誤：{str(e)}")
 
 # ─────────────────────────────────────────
-# Gemini 逐字稿
+# Whisper 語音轉文字
 # ─────────────────────────────────────────
-def transcribe_with_gemini(audio_path):
-    model = genai.GenerativeModel("gemini-2.0-flash")
-
-    ext = audio_path.split(".")[-1].lower()
-    mime_map = {
-        "ogg": "audio/ogg", "mp3": "audio/mpeg", "m4a": "audio/mp4",
-        "wav": "audio/wav", "mp4": "audio/mp4", "aac": "audio/aac",
-        "flac": "audio/flac", "webm": "audio/webm"
-    }
-    mime_type = mime_map.get(ext, "audio/mpeg")
-
+def transcribe_with_whisper(audio_path):
     with open(audio_path, "rb") as f:
-        audio_data = f.read()
+        response = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"]
+        )
+    
+    # 組合帶時間戳的逐字稿
+    segments = response.segments if hasattr(response, 'segments') else []
+    if segments:
+        lines = []
+        for seg in segments:
+            start = int(seg.start)
+            minutes = start // 60
+            seconds = start % 60
+            lines.append(f"[{minutes:02d}:{seconds:02d}] {seg.text.strip()}")
+        return "\n".join(lines)
+    else:
+        return response.text
 
-    prompt = """請分析這段音訊，完成以下任務：
+# ─────────────────────────────────────────
+# GPT 語者辨識
+# ─────────────────────────────────────────
+def analyze_speakers(transcript_text):
+    prompt = f"""以下是一段會議逐字稿（含時間戳），請分析並完成：
 
-1. 產生完整逐字稿，格式：[語者N][時間戳] 發言內容
-2. 嘗試從對話判斷會議日期與名稱
+1. 辨識不同語者，標記為語者1、語者2...
+2. 嘗試從內容判斷會議日期與名稱
+3. 為每位語者取代表性發言片段
+
+逐字稿：
+{transcript_text}
 
 只回傳 JSON，不要其他文字：
-{
-  "transcript": "[語者1][00:00] 內容\\n[語者2][00:30] 內容",
-  "speakers": ["語者1", "語者2"],
-  "meeting_date": "2024/01/15 或 null",
+{{
+  "transcript": "[語者1][00:00] 內容\\n[語者2][00:30] 內容...",
+  "meeting_date": "yyyy/mm/dd 或 null",
   "meeting_name": "名稱 或 null",
-  "speaker_first_appearance": {"語者1": "00:00", "語者2": "00:30"},
-  "speaker_samples": {"語者1": ["句子1", "句子2"], "語者2": ["句子1"]},
-  "total_duration_seconds": 3600
-}
+  "speaker_samples": {{
+    "語者1": {{"samples": ["發言1", "發言2"], "late": false, "first_ts": "00:00"}},
+    "語者2": {{"samples": ["發言1", "發言2"], "late": false, "first_ts": "02:30"}}
+  }}
+}}
 
 語者取樣規則：
-- 每位語者取前2~3句
-- 若第一次出現超過總時長1/3，取5句"""
+- 每位語者取前2~3句有代表性的發言
+- 若語者第一次出現超過總時長1/3，late設為true並取5句"""
 
-    response = model.generate_content([
-        {"mime_type": mime_type, "data": audio_data},
-        prompt
-    ])
-
-    raw = re.sub(r"```json|```", "", response.text.strip()).strip()
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+    raw = re.sub(r"```json|```", "", response.choices[0].message.content.strip()).strip()
     data = json.loads(raw)
 
     transcript = data["transcript"]
-    total_seconds = data.get("total_duration_seconds", 3600)
-    first_appearance = data.get("speaker_first_appearance", {})
-    late_threshold = total_seconds / 3
-
-    speaker_samples = {}
-    for speaker, samples in data.get("speaker_samples", {}).items():
-        ts = first_appearance.get(speaker, "00:00")
-        seconds = timestamp_to_seconds(ts)
-        speaker_samples[speaker] = {
-            "samples": samples,
-            "late": seconds > late_threshold,
-            "first_ts": ts
-        }
-
+    speaker_samples = data.get("speaker_samples", {})
     meeting_info = {
         "date": data.get("meeting_date"),
         "name": data.get("meeting_name"),
@@ -247,17 +246,6 @@ def transcribe_with_gemini(audio_path):
 
     return transcript, speaker_samples, meeting_info
 
-def timestamp_to_seconds(ts):
-    try:
-        parts = ts.split(":")
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + int(parts[1])
-        elif len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-    except:
-        return 0
-    return 0
-
 # ─────────────────────────────────────────
 # 建立語者確認訊息
 # ─────────────────────────────────────────
@@ -265,11 +253,11 @@ def build_speaker_confirm_message(speaker_samples, meeting_info):
     lines = ["🎙️ 請確認以下語者身份：\n"]
 
     for speaker, info in speaker_samples.items():
-        if info["late"]:
-            lines.append(f"⚠️【{speaker}】（{info['first_ts']} 才出現，提供較多內容）")
+        if info.get("late"):
+            lines.append(f"⚠️【{speaker}】（{info.get('first_ts','')} 才出現，提供較多內容）")
         else:
-            lines.append(f"【{speaker}】（{info['first_ts']} 出現）")
-        for s in info["samples"]:
+            lines.append(f"【{speaker}】（{info.get('first_ts','')} 出現）")
+        for s in info.get("samples", []):
             lines.append(f"  「{s}」")
         lines.append("")
 
@@ -301,7 +289,7 @@ def parse_meeting_info(text):
     return {"date": date_match.group(1).strip(), "name": name_match.group(1).strip()}
 
 # ─────────────────────────────────────────
-# GPT 生成內容
+# GPT 生成會議內容
 # ─────────────────────────────────────────
 def generate_meeting_content(transcript, speaker_map, meeting_info):
     replaced = transcript
